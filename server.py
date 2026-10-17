@@ -17,10 +17,18 @@ Configuration is via environment variables:
   MCP_HOST            interface to bind to (default 0.0.0.0)
   MCP_PORT            port to listen on (default 8942)
   MCP_AUTH_TOKEN      shared secret required as `Authorization: Bearer <token>`
-                      on every request (optional — if unset, the server is open
-                      to anyone who can reach it; see README for why that matters
-                      more than usual here: this API returns people's viewing
-                      history and email addresses)
+                      on every request (optional — if unset, and OIDC below is
+                      not configured either, the server is open to anyone who
+                      can reach it; see README for why that matters more than
+                      usual here: this API returns people's viewing history and
+                      email addresses). With OIDC configured it is accepted
+                      next to OAuth tokens.
+  OIDC_CONFIG_URL     OpenID Connect discovery URL of the identity provider, e.g.
+                      https://auth.example.com/application/o/tracearr-mcp/.well-known/openid-configuration
+  OIDC_CLIENT_ID      client id of this server at the identity provider
+  OIDC_CLIENT_SECRET  client secret of this server at the identity provider
+  MCP_PUBLIC_URL      the URL clients reach this server at, e.g.
+                      https://tracearr-mcp.example.com (required with OIDC)
 
 Tracearr's Public API v2 needs Tracearr 2.0.0 or later (earlier versions serve v1
 only). It lives at a fixed `/api/v2/public` prefix, so there is no API-version
@@ -34,11 +42,13 @@ network/VLAN — never forward it externally) rather than being spawned
 per-client over stdio, so any MCP client on the LAN can connect to
 http://<host>:<port>/mcp.
 
-Auth here is a single shared bearer token checked by plain middleware, not
-the SDK's built-in OAuth support (mcp.server.auth) — that machinery expects
-a full OAuth authorization server (issuer/resource metadata, RFC 8414/8707/
-9068 discovery), which is unwarranted complexity for a single internal
-secret shared by trusted LAN clients.
+Auth comes in two flavours:
+- OIDC_* set: the SDK's OAuth support (mcp.server.auth) with this server as the
+  authorization server and the login delegated to the OIDC provider (see
+  oidc.py). This is what a server published through a reverse proxy, and used
+  as a claude.ai connector, needs.
+- Only MCP_AUTH_TOKEN set: a single shared bearer token checked by plain
+  middleware, for trusted LAN clients.
 """
 
 import asyncio
@@ -56,6 +66,9 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+from oidc import CALLBACK_PATH, OIDCProvider
+
 
 def _require_env(name: str) -> str:
     value = os.environ.get(name)
@@ -70,6 +83,16 @@ TRACEARR_API_KEY = _require_env("TRACEARR_API_KEY")
 MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8942"))
 MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN")
+
+OIDC_SETTINGS = ("OIDC_CONFIG_URL", "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET", "MCP_PUBLIC_URL")
+OIDC_ENABLED = any(os.environ.get(name) for name in OIDC_SETTINGS[:3])
+if OIDC_ENABLED:
+    # Half an OIDC configuration is a mistake, not a request to run without
+    # auth: refuse to start rather than fall back to something weaker.
+    OIDC_CONFIG_URL, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, MCP_PUBLIC_URL = (
+        _require_env(name) for name in OIDC_SETTINGS
+    )
+    MCP_PUBLIC_URL = MCP_PUBLIC_URL.rstrip("/")
 
 # Page-size ceilings the API documents: 100 for most cursor-paginated endpoints,
 # 1000 for watched-media (its rows are far smaller).
@@ -90,7 +113,33 @@ client = httpx.Client(
     timeout=30,
 )
 
-mcp = MCPServer("tracearr", instructions=INSTRUCTIONS)
+if OIDC_ENABLED:
+    oidc_provider = OIDCProvider(
+        config_url=OIDC_CONFIG_URL,
+        client_id=OIDC_CLIENT_ID,
+        client_secret=OIDC_CLIENT_SECRET,
+        public_url=MCP_PUBLIC_URL,
+        static_token=MCP_AUTH_TOKEN,
+    )
+    mcp = MCPServer(
+        "tracearr",
+        instructions=INSTRUCTIONS,
+        auth_server_provider=oidc_provider,
+        auth=AuthSettings(
+            issuer_url=MCP_PUBLIC_URL,
+            resource_server_url=f"{MCP_PUBLIC_URL}/mcp",
+            # Tokens are only ever minted by this server, for this server.
+            validate_token_resource=False,
+            client_registration_options=ClientRegistrationOptions(enabled=True),
+        ),
+    )
+
+    @mcp.custom_route(CALLBACK_PATH, methods=["GET"])
+    async def oidc_callback(request: Request) -> Response:
+        return await oidc_provider.callback(request)
+
+else:
+    mcp = MCPServer("tracearr", instructions=INSTRUCTIONS)
 
 
 def _error_detail(response: httpx.Response) -> str:
@@ -355,7 +404,8 @@ def watched_media(
 
 
 # Paths that must stay reachable without MCP_AUTH_TOKEN, so Docker's own
-# HEALTHCHECK, Dockhand's health probe, etc. don't need the secret.
+# HEALTHCHECK, Dockhand's health probe, etc. don't need the secret. (With OIDC
+# the SDK only guards /mcp, so these are open there too.)
 UNAUTHENTICATED_PATHS = {"/health", "/ready"}
 
 
@@ -431,11 +481,16 @@ def build_app():
     tests can exercise the real, fully-wired app without going through uvicorn."""
     app = mcp.streamable_http_app(host=MCP_HOST)
 
-    if MCP_AUTH_TOKEN:
+    if OIDC_ENABLED:
+        # The SDK already wired the OAuth routes and token check into the app.
+        print(f"Auth enabled: OAuth via OIDC provider {OIDC_CONFIG_URL}", file=sys.stderr)
+        if MCP_AUTH_TOKEN:
+            print("MCP_AUTH_TOKEN is accepted as a bearer token as well", file=sys.stderr)
+    elif MCP_AUTH_TOKEN:
         app.add_middleware(BearerTokenMiddleware)
         print("Auth enabled: Authorization: Bearer <token> required", file=sys.stderr)
     else:
-        print("WARNING: MCP_AUTH_TOKEN not set — server is open to anyone who can reach it", file=sys.stderr)
+        print("WARNING: neither OIDC nor MCP_AUTH_TOKEN is set — server is open to anyone who can reach it", file=sys.stderr)
 
     return app
 

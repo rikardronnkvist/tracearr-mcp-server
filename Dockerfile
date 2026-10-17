@@ -49,14 +49,14 @@ RUN addgroup -S app && adduser -S -G app -H -s /sbin/nologin app
 
 WORKDIR /app
 COPY --from=builder /deps /deps
-COPY server.py .
+COPY server.py oidc.py ./
 
 # scratch has no base layers of its own, so copying `prep`'s current merged
 # filesystem here — rather than stacking more layers on alpine directly —
 # is what actually realizes the deletions above as reduced image size.
 FROM scratch AS runtime
 
-LABEL org.opencontainers.image.source="https://github.com/barrow1990/tracearr-mcp-server" \
+LABEL org.opencontainers.image.source="https://github.com/rikardronnkvist/tracearr-mcp-server" \
       org.opencontainers.image.licenses="MIT"
 
 COPY --from=prep / /
@@ -73,7 +73,7 @@ WORKDIR /app
 
 USER app
 
-EXPOSE 8941
+EXPOSE 8942
 
 # Liveness only (process up, HTTP serving) — not Tracearr connectivity, so a
 # transient Tracearr outage doesn't get Dockhand/Docker restarting this
@@ -81,7 +81,7 @@ EXPOSE 8941
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD ["python", "-c", "\
 import os, sys, urllib.request; \
-port = os.environ.get('MCP_PORT', '8941'); \
+port = os.environ.get('MCP_PORT', '8942'); \
 sys.exit(0 if urllib.request.urlopen(f'http://localhost:{port}/health', timeout=3).status == 200 else 1)"]
 
 ENTRYPOINT ["python", "server.py"]
