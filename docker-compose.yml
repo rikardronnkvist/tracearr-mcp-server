@@ -1,9 +1,10 @@
 services:
   tracearr-mcp:
-    # Built and pushed by .github/workflows/ci.yml: :latest from main, :dev from dev.
+    # Built and pushed by .github/workflows/ci.yml: :latest is the newest release,
+    # :main / :dev follow those branches.
     # Use `build: .` instead (and drop this `image:` line) if you'd rather
     # build locally from the Dockerfile — both work against this same file.
-    image: ghcr.io/barrow1990/tracearr-mcp-server:latest
+    image: ghcr.io/rikardronnkvist/tracearr-mcp-server:latest
     container_name: tracearr-mcp
     # TRACEARR_URL / TRACEARR_API_KEY / MCP_AUTH_TOKEN are loaded from these
     # files directly (not via `environment: ${VAR}` substitution, which
